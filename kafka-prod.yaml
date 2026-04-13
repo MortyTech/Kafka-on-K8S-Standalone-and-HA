@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: prod
+spec:
+  serviceName: kafka
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      # ✅ راه حل اصلی مشکل دسترسی
+      securityContext:
+        fsGroup: 1000
+
+      # ✅ (اختیاری) پاکسازی فایل های مزاحم در صورت وجود
+      initContainers:
+      - name: fix-permissions
+        image: busybox:latest
+        command:
+        - sh
+        - -c
+        - |
+          echo "Removing lost+found and fixing permissions..."
+          rm -rf /var/lib/kafka/data/lost+found
+          chown -R 1000:1000 /var/lib/kafka/data
+          chmod -R 755 /var/lib/kafka/data
+        volumeMounts:
+        - name: kafka-data
+          mountPath: /var/lib/kafka/data
+        securityContext:
+          runAsUser: 0  # برای پاکسازی نیاز به root است
+
+      containers:
+      - name: kafka
+        image: apache/kafka:latest
+        ports:
+        - containerPort: 9092
+          name: plaintext
+        - containerPort: 9093
+          name: controller
+
+        command:
+        - sh
+        - -c
+        - |
+          export KAFKA_NODE_ID=$(hostname | grep -o '[^-]*$')
+          # تبدیل 0,1,2 به 1,2,3 (چون KRaft ID باید حداقل 1 باشد)
+          export KAFKA_NODE_ID=$((KAFKA_NODE_ID + 1))
+          export KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://${HOSTNAME}.kafka.${POD_NAMESPACE}.svc.cluster.local:9092"
+          /etc/kafka/docker/run
+
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+
+        - name: KAFKA_PROCESS_ROLES
+          value: "broker,controller"
+        - name: KAFKA_CONTROLLER_LISTENER_NAMES
+          value: "CONTROLLER"
+        - name: KAFKA_LISTENERS
+          value: "PLAINTEXT://:9092,CONTROLLER://:9093"
+        - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+          value: "1@kafka-0.kafka.$(POD_NAMESPACE).svc.cluster.local:9093,2@kafka-1.kafka.$(POD_NAMESPACE).svc.cluster.local:9093,3@kafka-2.kafka.$(POD_NAMESPACE).svc.cluster.local:9093"
+        - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+          value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+        - name: KAFKA_INTER_BROKER_LISTENER_NAME
+          value: "PLAINTEXT"
+        - name: KAFKA_LOG_DIRS
+          value: "/var/lib/kafka/data"
+        
+        # تنظیمات HA
+        - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+          value: "3"
+        - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+          value: "3"
+        - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+          value: "2"
+        - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
+          value: "0"
+        - name: KAFKA_NUM_PARTITIONS
+          value: "3"
+
+        volumeMounts:
+        - name: kafka-data
+          mountPath: /var/lib/kafka/data
+
+  volumeClaimTemplates:
+  - metadata:
+      name: kafka-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: longhorn
+      resources:
+        requests:
+          storage: 10Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: prod
+spec:
+  clusterIP: None
+  selector:
+    app: kafka
+  ports:
+  - name: plaintext
+    port: 9092
+    targetPort: 9092
+  - name: controller
+    port: 9093
+    targetPort: 9093
