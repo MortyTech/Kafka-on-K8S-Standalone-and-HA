@@ -133,4 +133,135 @@ kubectl delete namespace poc prod
 
 ---
 
+---
+
+### 🩺 Initial Cluster Health Check (Are Nodes in Sync?)
+
+Since you are using KRaft (without Zookeeper), metadata is distributed between the Controller and Brokers. To check the cluster status, access one of the Pods and run the following commands:
+
+```bash
+# Access the first Pod
+kubectl exec -it kafka-0 -n prod -- /bin/bash
+
+# Inside the Pod:
+# 1. Check metadata status (Quorum)
+/opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server localhost:9092 describe --status
+
+# Output should look something like this and show that Leader and Followers are present:
+# NodeId 1  ...  Leader
+# NodeId 2  ...  Follower
+# NodeId 3  ...  Follower
+
+# 2. List active Brokers
+/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092
+# Should display 3 Brokers with IDs 1,2,3.
+```
+
+If the output of these commands shows all 3 nodes, it means the cluster is in sync and its High Availability is guaranteed.
+
+---
+
+---
+
+### ✅ High Availability (HA) Practical Test
+
+Now that everything is stable, let's simulate a node failure to ensure the cluster survives.
+
+#### 1. Create a Test Topic with Full Replication Factor
+
+Open a terminal on `kafka-0` (or anywhere inside the cluster):
+
+```bash
+kubectl exec -it kafka-0 -n prod -- /bin/bash
+
+# Create a Topic with 3 partitions and 3 replicas
+/opt/kafka/bin/kafka-topics.sh --create \
+  --topic ha-test \
+  --partitions 3 \
+  --replication-factor 3 \
+  --bootstrap-server localhost:9092
+
+# Check the distribution status (Replicas should be spread across 1,2,3)
+/opt/kafka/bin/kafka-topics.sh --describe --topic ha-test --bootstrap-server localhost:9092
+```
+
+#### 2. Start a Consumer in Terminal 1 (Monitoring)
+
+```bash
+kubectl exec -it kafka-0 -n prod -- /bin/bash
+/opt/kafka/bin/kafka-console-consumer.sh \
+  --topic ha-test \
+  --from-beginning \
+  --bootstrap-server kafka.prod.svc.cluster.local:9092 \
+  --group test-group-ha
+```
+
+#### 3. Start a Producer in Terminal 2 (Sending Messages)
+
+```bash
+kubectl exec -it kafka-0 -n prod -- /bin/bash
+
+# A simple loop to send numbers
+for i in $(seq 1 1000); do echo "Message $i"; sleep 1; done | \
+/opt/kafka/bin/kafka-console-producer.sh \
+  --topic ha-test \
+  --bootstrap-server kafka.prod.svc.cluster.local:9092
+```
+
+#### 4. Simulate Node Failure (Terminal 3)
+
+While the Producer is sending and the Consumer is receiving messages, delete the leader node (`kafka-1`):
+
+```bash
+kubectl delete pod kafka-1 -n prod
+```
+
+#### 5. Observe the Results
+
+- **Consumer (Terminal 1):**  
+  You may see a message like `Group coordinator ... is unavailable` or `Rebalancing`. After a few seconds (approximately 10-20 seconds), the Consumer resumes receiving messages **without losing a single message**.
+
+- **Producer (Terminal 2):**  
+  You may see a `TimeoutException` or `Broker not available` error. In a manual test with the console, message sending stops and you'll need to `Ctrl+C` and restart. However, in real libraries (like Java/Python), automatic **Retry** occurs and the Producer continues operating without errors.
+
+- **New Quorum:**  
+  After a few seconds, a new leader (e.g., `kafka-0` or `kafka-2`) is elected. You can verify this with the following command:
+
+```bash
+/opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server localhost:9092 describe --status
+# Shows the new LeaderId
+```
+
+---
+
+### 🖥️ Where Should Clients Connect?
+
+#### From Inside Kubernetes (e.g., another Pod or service within the cluster)
+The best and most standard address is the **Headless Service name**:
+```
+kafka.prod.svc.cluster.local:9092
+```
+Why? Because the Kafka library first fetches metadata using this address and then connects directly to the relevant brokers (using addresses like `kafka-0.kafka...:9092`).
+
+#### From Outside Kubernetes (Developer Laptop)
+The current StatefulSet does **not** have an `EXTERNAL` listener configured. To add external access, you must:
+1. Create a **NodePort Service** for all three ports or use a **LoadBalancer**.
+2. Alternatively, use `kubectl port-forward` for temporary testing:
+   ```bash
+   kubectl port-forward -n prod pod/kafka-0 9092:9092
+   ```
+
+### 📌 Additional Note on Sync Status (ISR)
+
+In the `describe` output for the Topic, there is a column named **ISR (In-Sync Replicas)**. In a healthy cluster, this column should include all 3 brokers. When a node goes down, that node is removed from the ISR list, but `min.insync.replicas` set to `2` ensures that Producers with `acks=all` can still successfully write messages (since at least 2 replicas are alive).
+
+---
+
+### Current Status Summary
+
+✅ 3-node KRaft cluster running successfully on `prod`.  
+✅ Nodes are synchronized (`MaxFollowerLag=0`).  
+✅ Current leader is `kafka-1`.  
+✅ Ready for HA testing and client connections.
+
 **Happy messaging!** 🚀
